@@ -56,10 +56,50 @@ from torchao.testing.pt2e._xnnpack_quantizer import (
 from torchao.utils import get_current_accelerator_device
 
 
+def _swap_fx_fake_quant_modules(model: torch.nn.Module) -> None:
+    """
+    TODO: delete this after https://github.com/pytorch/pytorch/pull/194816 lands
+
+    Swap all `torch.ao.FusedMovingAvgObsFakeQuantize modules` in the FX
+    prepared `model` with a test only version that returns the qparams
+    the fused op actually used, matching torchao's PT2E version.
+    FX graph mode quantization is deprecated, so we adjust the reference
+    here instead of trying to match it exactly.
+
+    See https://github.com/pytorch/ao/pull/4824 for more details.
+    """
+    from torch.ao.quantization.fake_quantize import (
+        FusedMovingAvgObsFakeQuantize as _PyTorchFusedMovingAvgObsFakeQuantize,
+    )
+
+    class _TestFusedMovingAvgObsFakeQuantize(_PyTorchFusedMovingAvgObsFakeQuantize):
+        def __init__(self, fake_quant):
+            torch.nn.Module.__init__(self)
+            self.__dict__.update(fake_quant.__dict__)
+
+        def calculate_qparams(self) -> tuple[torch.Tensor, torch.Tensor]:
+            return self.scale, self.zero_point
+
+    for name, mod in list(model.named_modules()):
+        if type(mod) is _PyTorchFusedMovingAvgObsFakeQuantize:
+            *parent_name, attr_name = name.split(".")
+            parent = model.get_submodule(".".join(parent_name))
+            setattr(parent, attr_name, _TestFusedMovingAvgObsFakeQuantize(mod))
+
+
 class PT2EQATTestCase(QuantizationTestCase):
     """
     Base QuantizationTestCase for PT2E QAT with some helper methods.
     """
+
+    # Model weights are drawn from the ambient RNG when the test builds its
+    # model, so without seeding here the weights depend on which tests ran
+    # before, and numerics comparisons pass or fail depending on test order.
+    SEED = 0
+
+    def setUp(self):
+        super().setUp()
+        torch.manual_seed(self.SEED)
 
     class _BaseConvBnModel(torch.nn.Module):
         def __init__(
@@ -186,6 +226,7 @@ class PT2EQATTestCase(QuantizationTestCase):
             model_pt2e = convert_pt2e(model_pt2e)
             quant_result_pt2e = model_pt2e(*example_inputs)
             model_fx.eval()
+            _swap_fx_fake_quant_modules(model_fx)
             model_fx = _convert_to_reference_decomposed_fx(
                 model_fx,
                 backend_config=backend_config,
@@ -436,6 +477,7 @@ class TestQuantizePT2EQAT_ConvBn_Base(PT2EQATTestCase):
     #   'QuantizationConfig' object has no attribute '__bool__'
 
     def setUp(self):
+        super().setUp()
         # NB: Skip the test if this is a base class, this is to handle the test
         # discovery logic in buck which finds and runs all tests here including
         # the base class which we don't want to run
@@ -1314,6 +1356,69 @@ class TestQuantizeMixQATAndPTQ(QuantizationTestCase):
         self.checkGraphModuleNodes(
             exported_model.graph_module, expected_node_occurrence=node_occurrence
         )
+
+
+class TestFusedMovingAvgObsFakeQuantizeQParams(QuantizationTestCase):
+    def test_qparams_match_forward_per_tensor(self):
+        """
+        Test that calculate_qparams returns the same qparams that forward used,
+        for per tensor quantization.
+        """
+        fq = FusedMovingAvgObsFakeQuantize(
+            observer=MovingAverageMinMaxObserver,
+            quant_min=-8,
+            quant_max=7,
+            dtype=torch.qint8,
+            qscheme=torch.per_tensor_symmetric,
+        )
+        self._test_qparams_match_forward(fq, torch.tensor([-1.149422, 2.533506]))
+
+    def test_qparams_match_forward_per_channel(self):
+        """
+        Test that calculate_qparams returns the same qparams that forward used,
+        for per channel quantization.
+        """
+        fq = FusedMovingAvgObsFakeQuantize(
+            observer=MovingAveragePerChannelMinMaxObserver,
+            quant_min=-8,
+            quant_max=7,
+            dtype=torch.qint8,
+            qscheme=torch.per_channel_symmetric,
+            ch_axis=0,
+        )
+        self._test_qparams_match_forward(
+            fq, torch.tensor([[-1.149422, 2.533506], [0.3, -0.7]])
+        )
+
+    def _test_qparams_match_forward(self, fq, x):
+        fq(x)
+        scale, zero_point = fq.calculate_qparams()
+
+        # Test against reference qparams
+        ref_scale = torch.ones_like(fq.scale)
+        ref_zero_point = torch.zeros_like(fq.zero_point)
+        obs = fq.activation_post_process
+        torch.fused_moving_avg_obs_fake_quant(
+            x,
+            torch.zeros_like(fq.observer_enabled),  # freeze the observer
+            torch.ones_like(fq.fake_quant_enabled),
+            obs.min_val.clone(),
+            obs.max_val.clone(),
+            ref_scale,
+            ref_zero_point,
+            obs.averaging_constant,
+            obs.quant_min,
+            obs.quant_max,
+            fq.ch_axis,
+            fq.is_per_channel,
+            fq.is_symmetric_quant,
+        )
+        torch.testing.assert_close(scale, ref_scale, atol=0, rtol=0)
+        torch.testing.assert_close(zero_point, ref_zero_point, atol=0, rtol=0)
+
+        # The observer uses a different symmetric formula and should not match
+        obs_scale, _ = obs.calculate_qparams()
+        self.assertFalse(torch.equal(scale, obs_scale))
 
 
 if __name__ == "__main__":

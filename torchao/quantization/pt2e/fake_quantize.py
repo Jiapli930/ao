@@ -392,7 +392,6 @@ class FusedMovingAvgObsFakeQuantize(FakeQuantize):
 
     Similar to :class:`~torchao.quantization.pt2e.FakeQuantize`, and accepts the same attributes as the
     base class.
-
     """
 
     def __init__(
@@ -417,7 +416,21 @@ class FusedMovingAvgObsFakeQuantize(FakeQuantize):
 
     @torch.jit.export
     def calculate_qparams(self) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.activation_post_process.calculate_qparams()
+        """
+        Return a 2-tuple of the last (scale, zero_point) observed by forward
+        when fake_quant_enabled=1.
+
+        Note: This may return stale qparams if observer_enabled=1 but
+        fake_quant_enabled=0, since self.scale and self.zero_point are currently
+        populated by the fused op only when fake_quant_enabled=1. The proper fix
+        is always setting `self.scale` and `self.zero_point` in
+        `torch.fused_moving_avg_obs_fake_quant` in upstream pytorch, whether or
+        not fake quant is enabled.
+
+        TODO: https://github.com/pytorch/pytorch/pull/194815 fixes the staleness problem,
+        delete this paragraph after that PR lands.
+        """
+        return self.scale, self.zero_point
 
     @torch.jit.export
     def extra_repr(self) -> str:
